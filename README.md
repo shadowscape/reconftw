@@ -396,6 +396,8 @@ cd reconftw
 
 NewScan runs one `docker run --rm` per live web origin (`webs/webs_all.txt`, capped by `NEWSCAN_MAX_TARGETS` unless `--deep`), or against `NEWSCAN_TARGETS_FILE` if set. Findings land in `vulns/newscan.txt`, `vulns/newscan.jsonl` and `vulns/newscan/<host_port>/`.
 
+While it runs, a live line shows progress, for example `NewScan 1/3 done | elapsed 3h04m | ETA 6h08m | shadowscape.io: Phase 2 algorithmic analysis, 4 finding(s), rate-limited (HTTP 429), 5.00s pacing`. The same line goes to the log (`Recon/<target>/.log/`) every `NEWSCAN_PROGRESS_INTERVAL` seconds. NewScan itself reports only phases, not percentages, so the ETA is estimated from finished origins (or, before the first finishes, the worst case allowed by `NEWSCAN_TIMEOUT`).
+
 > [!WARNING]
 > NewScan is an **active** scanner: only point it at targets you are authorized to test. Its use is governed by the NewScan EULA. It needs a host Docker daemon, so it does not work when reconFTW itself runs inside the reconFTW Docker container (no Docker-in-Docker), and it is skipped when `PROXYCHAINS=true` because container traffic cannot be proxied.
 
@@ -734,6 +736,7 @@ NEWSCAN_MAX_TARGETS=25 # Max origins per run when DEEP=false (0 = no cap)
 NEWSCAN_PARALLEL=2 # Concurrent NewScan containers
 NEWSCAN_CONCURRENCY=0 # Passed to --concurrency (0 = NewScan default)
 NEWSCAN_TIMEOUT=1800 # Seconds per origin (0 = no timeout)
+NEWSCAN_PROGRESS_INTERVAL=300 # Seconds between NewScan progress lines in the log (live line on a terminal updates every 5s; 0 = no log lines)
 NEWSCAN_TARGETS_FILE="" # Optional list of subdomains/URLs to scan instead of webs/webs_all.txt
 NEWSCAN_ENFORCE_SCOPE=true # Drop NEWSCAN_TARGETS_FILE hosts that are not $domain or its subdomains
 NEWSCAN_URL_SEED=true # Seed each origin with its URLs from webs/url_extract.txt via --url-list

@@ -1233,6 +1233,98 @@ function _newscan_origins() {
     return 0
 }
 
+function _newscan_fmt_dur() {
+    local s="${1:-0}"
+    ((s < 0)) && s=0
+    if ((s >= 3600)); then
+        printf '%dh%02dm' $((s / 3600)) $((s % 3600 / 60))
+    elif ((s >= 60)); then
+        printf '%dm' $((s / 60))
+    else
+        printf '%ds' "$s"
+    fi
+}
+
+# NewScan's headless CLI prints no counts, only notices. Summarize one origin's console.log as
+# "<latest phase>, <N> finding(s)[, <rate-limit state>]".
+function _newscan_origin_status() {
+    local log="$1" phase="starting" findings=0 rate="" line
+    if [[ -s "$log" ]]; then
+        line=$(grep -E 'Phase [0-9.]+ (—|-+) ' "$log" | tail -n 1 || true)
+        if [[ -n "$line" ]]; then
+            phase="${line#*Phase }"
+            phase="Phase ${phase%%:*}"
+            phase="${phase/ — / }"
+            phase="${phase/ -- / }"
+            phase="${phase/ - / }"
+        fi
+        findings=$(grep -c '\[FINDING\]' "$log" || true)
+        line=$(grep -E 'Target is rate limiting|Rate limiting easing|Target stopped rate limiting' "$log" | tail -n 1 || true)
+        if [[ "$line" == *"Target is rate limiting"* ]]; then
+            rate="rate-limited"
+            [[ "$line" =~ HTTP\ ([0-9]+) ]] && rate+=" (HTTP ${BASH_REMATCH[1]})"
+            [[ "$line" =~ pacing\ requests\ ([0-9.]+)s ]] && rate+=", ${BASH_REMATCH[1]}s pacing"
+        elif [[ "$line" =~ pace\ now\ ([0-9.]+)s ]]; then
+            rate="easing, ${BASH_REMATCH[1]}s pacing"
+        fi
+    fi
+    printf '%s, %s finding(s)%s\n' "$phase" "${findings:-0}" "${rate:+, $rate}"
+}
+
+# Whole-run ETA. After an origin finishes: elapsed / done * remaining (as lib/parallel.sh does
+# for batches). Before that, the worst case allowed by the per-origin timeout, or "--".
+function _newscan_eta() {
+    local elapsed="$1" finished="$2" total="$3" max_par="$4" timeout="$5" bound
+    if ((finished > 0)); then
+        _newscan_fmt_dur $((elapsed * (total - finished) / finished))
+    elif ((timeout > 0)); then
+        bound=$(((total + max_par - 1) / max_par * (timeout + 60) - elapsed))
+        printf 'max %s' "$(_newscan_fmt_dur "$bound")"
+    else
+        printf -- '--'
+    fi
+}
+
+function _newscan_progress_line() {
+    local origins="$1" launched="$2" total="$3" max_par="$4" elapsed="$5"
+    local finished=0 n=0 origin slug active="" timeout="${NEWSCAN_TIMEOUT:-0}"
+    [[ -z "${TIMEOUT_CMD:-}" ]] && timeout=0
+    while IFS= read -r origin; do
+        [[ -z "$origin" ]] && continue
+        n=$((n + 1))
+        ((n > launched)) && break
+        slug=$(_newscan_slug "$origin")
+        if [[ -f "vulns/newscan/${slug}/exit_code" ]]; then
+            finished=$((finished + 1))
+        else
+            active+="; ${origin#*://}: $(_newscan_origin_status "vulns/newscan/${slug}/console.log")"
+        fi
+    done <"$origins"
+    printf 'NewScan %s/%s done | elapsed %s | ETA %s%s\n' "$finished" "$total" "$(_newscan_fmt_dur "$elapsed")" \
+        "$(_newscan_eta "$elapsed" "$finished" "$total" "$max_par" "$timeout")" "${active:+ |${active#;}}"
+}
+
+# Block until at most $1 scans are running, redrawing the live progress line every few seconds
+# and appending it to $LOGFILE every NEWSCAN_PROGRESS_INTERVAL seconds. Polls instead of
+# `wait -n` so progress keeps updating during multi-hour scans.
+function _newscan_wait_running() {
+    local keep="$1" origins="$2" launched="$3" total="$4" max_par="$5" start_ts="$6"
+    local interval="${NEWSCAN_PROGRESS_INTERVAL:-300}" now line
+    while (($(jobs -rp | wc -l) > keep)); do
+        now=$(date +%s)
+        if ((now - _NEWSCAN_LAST_DRAW >= 5)) || { ((interval > 0)) && ((now - _NEWSCAN_LAST_LOG >= interval)); }; then
+            line=$(_newscan_progress_line "$origins" "$launched" "$total" "$max_par" $((now - start_ts)))
+            declare -F ui_live_progress_update >/dev/null 2>&1 && ui_live_progress_update "$line"
+            _NEWSCAN_LAST_DRAW=$now
+            if ((interval > 0)) && ((now - _NEWSCAN_LAST_LOG >= interval)); then
+                printf '[%s] newscan_checks progress: %s\n' "$(date +'%Y-%m-%d %H:%M:%S')" "$line" >>"$LOGFILE"
+                _NEWSCAN_LAST_LOG=$now
+            fi
+        fi
+        sleep 1
+    done
+}
+
 function _newscan_scan_origin() {
     local origin="$1" idx="$2" image="$3"
     local out
@@ -1336,12 +1428,20 @@ function newscan_checks() {
             return 0
         fi
 
-        local max_par="${NEWSCAN_PARALLEL:-2}" idx=0 origin
+        local max_par="${NEWSCAN_PARALLEL:-2}" idx=0 origin total start_ts
         ((max_par < 1)) && max_par=1
-        _print_msg INFO "Running: NewScan on $(wc -l <"$origins" | tr -d ' ') origin(s)"
+        total=$(wc -l <"$origins" | tr -d ' ')
+        _print_msg INFO "Running: NewScan on ${total} origin(s)"
+        # A leftover exit_code from an earlier run would count that origin as done in the progress line.
+        while IFS= read -r origin; do
+            rm -f "vulns/newscan/$(_newscan_slug "$origin")/exit_code"
+        done <"$origins"
+        start_ts=$(date +%s)
+        _NEWSCAN_LAST_DRAW=0
+        _NEWSCAN_LAST_LOG=0
         while IFS= read -r origin; do
             [[ -z "$origin" ]] && continue
-            while (($(jobs -rp | wc -l) >= max_par)); do wait -n 2>/dev/null || true; done
+            _newscan_wait_running $((max_par - 1)) "$origins" "$idx" "$total" "$max_par" "$start_ts" </dev/null
             idx=$((idx + 1))
             # Dry run stays in the foreground so run_command's dry-run tracking reaches the module summary.
             if [[ "${DRY_RUN:-false}" == "true" ]]; then
@@ -1350,7 +1450,9 @@ function newscan_checks() {
                 _newscan_scan_origin "$origin" "$idx" "$image" </dev/null &
             fi
         done <"$origins"
+        _newscan_wait_running 0 "$origins" "$idx" "$total" "$max_par" "$start_ts"
         wait
+        declare -F ui_live_progress_end >/dev/null 2>&1 && ui_live_progress_end
 
         : >".tmp/newscan_findings.txt"
         : >".tmp/newscan_findings.jsonl"

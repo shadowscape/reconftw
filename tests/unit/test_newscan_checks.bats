@@ -66,6 +66,8 @@ case "$1" in
             [[ "$prev" == "-v" && "$a" == *:/out ]] && out="${a%:/out}"
             prev="$a"
         done
+        [[ -n "${MOCK_RUN_NOTICES:-}" ]] && printf '%s\n' "$MOCK_RUN_NOTICES"
+        sleep "${MOCK_RUN_SLEEP:-0}"
         [[ "${MOCK_RUN_RC:-1}" == 2 ]] && exit 2
         cp "${NEWSCAN_FIXTURE:?}" "$out/newscan.json"
         exit 1 ;;
@@ -238,4 +240,51 @@ run_targets() {
     export_findings_jsonl
     [ "$(jq -c 'select(.tool == "newscan" and .severity == "high") | .host' report/findings_normalized.jsonl)" = '"api.example.com"' ]
     [ "$(jq -r 'select(.tool == "newscan") | .source_file' report/findings_normalized.jsonl | sort -u)" = "vulns/newscan.jsonl" ]
+}
+
+@test "_newscan_origin_status: reports latest phase, findings and rate-limit state" {
+    local log="${TEST_DIR}/console.log"
+    cat >"$log" <<'LOG'
+  scanning https://api.example.com (goal: )
+  - Phase 1 — recon: authenticating + tool-driven discovery.
+  [FINDING][HIGH] Broken object level authorization
+  - Phase 2.5 — adaptive re-discovery (round 1/3): probing new paths
+  - Target is rate limiting (HTTP 429) — pacing requests 5.00s apart. The scan continues, slower (88 limited responses so far).
+  [FINDING][LOW] Verbose server banner
+LOG
+    [ "$(_newscan_origin_status "$log")" = "Phase 2.5 adaptive re-discovery (round 1/3), 2 finding(s), rate-limited (HTTP 429), 5.00s pacing" ]
+
+    printf '%s\n' "  - Rate limiting easing — pace now 0.50s between requests." >>"$log"
+    [ "$(_newscan_origin_status "$log")" = "Phase 2.5 adaptive re-discovery (round 1/3), 2 finding(s), easing, 0.50s pacing" ]
+
+    printf '%s\n' "  - Target stopped rate limiting — back to full speed." "  - Phase 4 — aggregate: 2 findings, 9 observations" >>"$log"
+    [ "$(_newscan_origin_status "$log")" = "Phase 4 aggregate, 2 finding(s)" ]
+
+    [ "$(_newscan_origin_status "${TEST_DIR}/missing.log")" = "starting, 0 finding(s)" ]
+}
+
+@test "_newscan_eta: extrapolates after a finished origin, else timeout worst case" {
+    [ "$(_newscan_eta 3600 1 3 1 10800)" = "2h00m" ]
+    [ "$(_newscan_eta 600 0 3 1 10800)" = "max 8h53m" ]
+    [ "$(_newscan_eta 600 0 3 2 10800)" = "max 5h52m" ]
+    [ "$(_newscan_eta 600 0 3 1 0)" = "--" ]
+    [ "$(_newscan_fmt_dur 45)" = "45s" ]
+    [ "$(_newscan_fmt_dur 754)" = "12m" ]
+}
+
+@test "newscan_checks: logs progress lines while a scan runs, ignoring stale exit codes" {
+    printf '%s\n' "https://api.example.com" >webs/webs_all.txt
+    mkdir -p vulns/newscan/api.example.com
+    printf '1\n' >vulns/newscan/api.example.com/exit_code
+    export NEWSCAN_PROGRESS_INTERVAL=1 MOCK_RUN_SLEEP=4
+    export MOCK_RUN_NOTICES="  - Phase 2 — algorithmic analysis: deterministic baseline checks
+  [FINDING][HIGH] Broken object level authorization
+  - Target is rate limiting (HTTP 429) — pacing requests 5.00s apart. The scan continues, slower (3 limited responses so far)."
+
+    run newscan_checks
+    [ "$status" -eq 0 ]
+    grep -Fq "newscan_checks progress: NewScan 0/1 done | elapsed " "$LOGFILE"
+    grep -Fq "api.example.com: Phase 2 algorithmic analysis, 1 finding(s), rate-limited (HTTP 429), 5.00s pacing" "$LOGFILE"
+    [ "$(grep -c 'newscan_checks progress: NewScan 1/1 done' "$LOGFILE" || true)" -eq 0 ]
+    [ "$(cat vulns/newscan/api.example.com/exit_code)" = "1" ]
 }
