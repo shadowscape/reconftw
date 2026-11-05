@@ -189,6 +189,7 @@ reconFTW is packed with features to make reconnaissance thorough and efficient. 
 - **Web Cache**: Identifies web cache vulnerabilities ([Web-Cache-Vulnerability-Scanner](https://github.com/Hackmanit/Web-Cache-Vulnerability-Scanner) and [toxicache](https://github.com/xhzeem/toxicache)).
 - **4XX Bypassing**: Attempts to bypass 4XX responses ([nomore403](https://github.com/devploit/nomore403)).
 - **Parameter Fuzzing**: Fuzzes URL parameters for vulnerabilities ([nuclei](https://github.com/projectdiscovery/nuclei)).
+- **NewScan**: Optional active API/web scanning of every live subdomain origin, or a custom list via NEWSCAN_TARGETS_FILE ([NewScan](https://newnormalsecurity.com/newscan); proprietary Docker image, install manually).
 
 ### Extras
 
@@ -384,6 +385,19 @@ cd reconftw
    ```bash
    docker exec <container-id> ./reconftw.sh --health-check
    ```
+
+### NewScan (optional)
+
+[NewScan](https://newnormalsecurity.com/newscan) is a proprietary active API/web scanner from New Normal Security. It ships only as a Docker image inside the desktop download (SSO sign-in and EULA acceptance required), so `install.sh` does not install it.
+
+1. Download NewScan from newnormalsecurity.com and load the image: `docker load -i newscan-image.tar`. On Linux, use the Linux build that matches your CPU architecture (an arm64 image fails with `exec format error` on x86_64).
+2. Set `NEWSCAN=true` in `reconftw.cfg` (it is already on in `config/reconftw_full.cfg`). Optionally pin `NEWSCAN_IMAGE="newscan:<tag>"`; by default the newest local `newscan:*` tag is used.
+3. It runs as part of the vulnerability module (`-a`, `-w`), or on its own: `./reconftw.sh -d target.com -c newscan_checks`.
+
+NewScan runs one `docker run --rm` per live web origin (`webs/webs_all.txt`, capped by `NEWSCAN_MAX_TARGETS` unless `--deep`), or against `NEWSCAN_TARGETS_FILE` if set. Findings land in `vulns/newscan.txt`, `vulns/newscan.jsonl` and `vulns/newscan/<host_port>/`.
+
+> [!WARNING]
+> NewScan is an **active** scanner: only point it at targets you are authorized to test. Its use is governed by the NewScan EULA. It needs a host Docker daemon, so it does not work when reconFTW itself runs inside the reconFTW Docker container (no Docker-in-Docker), and it is skipped when `PROXYCHAINS=true` because container traffic cannot be proxied.
 
 ### Terraform + Ansible
 
@@ -712,6 +726,22 @@ WEBCACHE=true # Check for Web Cache issues
 WEBCACHE_TOXICACHE=true # Complement web cache checks with toxicache
 BYPASSER4XX=true # Check for 4XX bypasses
 FUZZPARAMS=true # Fuzz parameters values
+NEWSCAN=false # NewScan active API/web scanner, one docker run per live web origin (proprietary image, manual install; opt-in)
+NEWSCAN_IMAGE="" # Local image tag, e.g. "newscan:26.10.21"; empty = newest local newscan:* tag
+NEWSCAN_SCAN_MODE="api" # api|web (web = Playwright SPA crawl)
+NEWSCAN_PROFILE="quick" # quick|baseline|deep need no AI key; full|safe|agentic need a BYOK key (else NewScan downgrades to quick)
+NEWSCAN_MAX_TARGETS=25 # Max origins per run when DEEP=false (0 = no cap)
+NEWSCAN_PARALLEL=2 # Concurrent NewScan containers
+NEWSCAN_CONCURRENCY=0 # Passed to --concurrency (0 = NewScan default)
+NEWSCAN_TIMEOUT=1800 # Seconds per origin (0 = no timeout)
+NEWSCAN_TARGETS_FILE="" # Optional list of subdomains/URLs to scan instead of webs/webs_all.txt
+NEWSCAN_ENFORCE_SCOPE=true # Drop NEWSCAN_TARGETS_FILE hosts that are not $domain or its subdomains
+NEWSCAN_URL_SEED=true # Seed each origin with its URLs from webs/url_extract.txt via --url-list
+NEWSCAN_SEED_MAX=2000 # Max seed URLs per origin
+NEWSCAN_HEADERS="" # Extra request headers, ';'-separated, e.g. "X-Bug-Bounty: me;X-Test: 1"
+NEWSCAN_ENV_FILE="" # Optional --env-file with BYOK provider keys (e.g. ~/.newscan/.env)
+NEWSCAN_USE_APP_CONFIG=false # Mount the newscan-configs volume read-only. NewScan 26.10.21 crashes on a read-only config dir (writes license.json.tmp) and the desktop app's volume is named newscan_newscan-configs, so leave false and pass BYOK keys via NEWSCAN_ENV_FILE
+NEWSCAN_DOCKER_NETWORK="" # Optional docker --network value
 
 # Extra features
 NOTIFICATION=false # Notification for every function
