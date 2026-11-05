@@ -3,7 +3,8 @@
 # reconFTW - Vulnerability scanning module
 # Contains: xss, ssrf_checks, crlf_checks, lfi, ssti,
 #           sqli, test_ssl, spraying, command_injection, 4xxbypass,
-#           smuggling, webcache, fuzzparams, nuclei_dast, fray_checks
+#           smuggling, webcache, fuzzparams, nuclei_dast, fray_checks,
+#           newscan_checks
 # This file is sourced by reconftw.sh - do not execute directly
 [[ -z "${SCRIPTPATH:-}" ]] && {
     echo "Error: This module must be sourced by reconftw.sh" >&2
@@ -1173,6 +1174,214 @@ function fray_checks() {
         fi
     else
         if [[ $FRAY_EXTRA == false ]]; then
+            skip_notification "disabled"
+        else
+            skip_notification "processed"
+        fi
+    fi
+}
+
+# NewScan ships only as a local Docker image (proprietary, no public repo), so it runs
+# through `docker run` instead of a ${tools}/<repo>/venv like the other Python tools.
+# One NewScan run covers exactly one origin, so every live web origin gets its own run.
+function _newscan_resolve_image() {
+    if [[ -n "${NEWSCAN_IMAGE:-}" ]]; then
+        printf '%s\n' "$NEWSCAN_IMAGE"
+        return 0
+    fi
+    docker image ls newscan --format '{{.Tag}}' 2>/dev/null | grep -v '^<none>$' \
+        | sort -V | tail -n 1 | sed 's/^/newscan:/'
+}
+
+function _newscan_slug() {
+    local slug="${1#*://}"
+    printf '%s\n' "${slug//[^A-Za-z0-9._-]/_}"
+}
+
+# Normalize subdomains/URLs from $1 into unique scheme://host[:port] origins on stdout.
+# Bare hosts reuse their live origin from webs/webs_all.txt, else default to https.
+# Anything that is not a plain hostname (userinfo, shell metacharacters, spaces) is rejected.
+function _newscan_origins() {
+    local line scheme hostport live rejected=0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line//$'\r'/}"
+        line="${line#"${line%%[![:space:]]*}"}"
+        line="${line%"${line##*[![:space:]]}"}"
+        [[ -z "$line" || "$line" == \#* ]] && continue
+        if [[ "$line" =~ ^([Hh][Tt][Tt][Pp][Ss]?)://([^/?#]+) ]]; then
+            scheme="${BASH_REMATCH[1],,}"
+            hostport="${BASH_REMATCH[2],,}"
+        else
+            scheme=""
+            hostport="${line%%[/?#]*}"
+            hostport="${hostport,,}"
+        fi
+        if ! [[ "$hostport" =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?(:[0-9]{1,5})?$ ]]; then
+            rejected=$((rejected + 1))
+            continue
+        fi
+        if [[ -z "$scheme" ]]; then
+            live=$(awk -v h="$hostport" '$0 == "https://" h || $0 == "http://" h { print; exit }' \
+                webs/webs_all.txt 2>/dev/null)
+            printf '%s\n' "${live:-https://${hostport}}"
+        else
+            printf '%s://%s\n' "$scheme" "$hostport"
+        fi
+    done <"$1"
+    ((rejected > 0)) && printf '[%s] newscan_checks: rejected %s malformed target line(s)\n' \
+        "$(date +'%Y-%m-%d %H:%M:%S')" "$rejected" >>"$LOGFILE"
+    return 0
+}
+
+function _newscan_scan_origin() {
+    local origin="$1" idx="$2" image="$3"
+    local out
+    out="$dir/vulns/newscan/$(_newscan_slug "$origin")"
+    mkdir -p "$out" || return 1
+    out=$(cd "$out" && pwd -P) || return 1
+    local cname="reconftw-newscan-$$-${idx}"
+
+    local -a cmd=(docker run --rm --name "$cname" -v "${out}:/out")
+    [[ -n "${NEWSCAN_ENV_FILE:-}" && -r "${NEWSCAN_ENV_FILE}" ]] && cmd+=(--env-file "$NEWSCAN_ENV_FILE")
+    [[ "${NEWSCAN_USE_APP_CONFIG:-false}" == "true" ]] && cmd+=(-v "newscan-configs:/app/configs:ro")
+    [[ -n "${NEWSCAN_DOCKER_NETWORK:-}" ]] && cmd+=(--network "$NEWSCAN_DOCKER_NETWORK")
+    cmd+=("$image" python -m newscan "$origin"
+        --scan-mode "${NEWSCAN_SCAN_MODE:-api}" --profile "${NEWSCAN_PROFILE:-quick}"
+        --fail-on info --json /out/newscan.json --sarif /out/newscan.sarif --md /out/newscan.md)
+
+    if [[ "${NEWSCAN_URL_SEED:-true}" == "true" && -s "$dir/webs/url_extract.txt" ]]; then
+        awk -v o="$origin" 'index($0, o "/") == 1 || index($0, o "?") == 1 || $0 == o' \
+            "$dir/webs/url_extract.txt" | head -n "${NEWSCAN_SEED_MAX:-2000}" >"$out/seed_urls.txt"
+        [[ -s "$out/seed_urls.txt" ]] && cmd+=(--url-list /out/seed_urls.txt)
+    fi
+    ((${NEWSCAN_CONCURRENCY:-0} > 0)) && cmd+=(--concurrency "$NEWSCAN_CONCURRENCY")
+    if [[ -n "${NEWSCAN_HEADERS:-}" ]]; then
+        local -a _hdrs=()
+        local _h
+        IFS=';' read -ra _hdrs <<<"$NEWSCAN_HEADERS"
+        for _h in "${_hdrs[@]}"; do
+            [[ -n "${_h// /}" ]] && cmd+=(--header "$_h")
+        done
+    fi
+    if [[ -n "${TIMEOUT_CMD:-}" ]] && ((${NEWSCAN_TIMEOUT:-0} > 0)); then
+        cmd=("$TIMEOUT_CMD" -k 60 "${NEWSCAN_TIMEOUT}s" "${cmd[@]}")
+    fi
+
+    local rc=0
+    if [[ "${DRY_RUN:-false}" == "true" ]]; then
+        run_command "${cmd[@]}" || rc=$?
+    else
+        run_command "${cmd[@]}" >"$out/console.log" 2>&1 || rc=$?
+    fi
+    # Killing the docker client does not always stop the container; remove it explicitly.
+    ((rc == 124 || rc == 137)) && docker rm -f "$cname" >/dev/null 2>&1
+    printf '%s\n' "$rc" >"$out/exit_code"
+    printf '[%s] newscan_checks: %s exit=%s\n' "$(date +'%Y-%m-%d %H:%M:%S')" "$origin" "$rc" >>"$LOGFILE"
+    return 0
+}
+
+function newscan_checks() {
+
+    # Create necessary directories
+    if ! ensure_dirs .tmp webs vulns; then return 1; fi
+
+    if { [[ ! -f "$called_fn_dir/.${FUNCNAME[0]}" ]] || [[ $DIFF == true ]]; } && [[ ${NEWSCAN:-false} == true ]]; then
+
+        local image="${NEWSCAN_IMAGE:-newscan:latest}"
+        if [[ "${DRY_RUN:-false}" != "true" ]]; then
+            if [[ "${PROXYCHAINS:-false}" == "true" ]]; then
+                _print_msg WARN "${FUNCNAME[0]}: PROXYCHAINS cannot route NewScan container traffic; skipping"
+                return 0
+            fi
+            if ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1; then
+                _print_msg WARN "${FUNCNAME[0]}: docker not installed or daemon not running"
+                return 0
+            fi
+            image=$(_newscan_resolve_image)
+            if [[ -z "$image" ]] || ! docker image inspect "$image" >/dev/null 2>&1; then
+                _print_msg WARN "${FUNCNAME[0]}: NewScan image '${image:-newscan:*}' not loaded (docker load -i newscan-image.tar)"
+                return 0
+            fi
+        fi
+        if [[ -n "${NEWSCAN_TARGETS_FILE:-}" ]] && [[ ! -f "$NEWSCAN_TARGETS_FILE" || ! -r "$NEWSCAN_TARGETS_FILE" ]]; then
+            _print_msg WARN "${FUNCNAME[0]}: NEWSCAN_TARGETS_FILE not readable: ${NEWSCAN_TARGETS_FILE}"
+            return 0
+        fi
+
+        start_func "${FUNCNAME[0]}" "NewScan API/web scanning"
+
+        ensure_webs_all || true
+        local origins=".tmp/newscan_origins.txt"
+        _newscan_origins "${NEWSCAN_TARGETS_FILE:-webs/webs_all.txt}" | sort -u >"$origins"
+
+        if [[ -n "${NEWSCAN_TARGETS_FILE:-}" && "${NEWSCAN_ENFORCE_SCOPE:-true}" == "true" &&
+            "$domain" != "Multi" ]] && ! [[ $domain =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            local _o _h
+            while IFS= read -r _o; do
+                _h="${_o#*://}"
+                _h="${_h%%:*}"
+                is_in_scope_host "$_h" "$domain" && printf '%s\n' "$_o"
+            done <"$origins" >"${origins}.scoped"
+            mv -f "${origins}.scoped" "$origins"
+        fi
+        [[ -n "${outOfScope_file:-}" ]] && deleteOutScoped "$outOfScope_file" "$origins"
+
+        local max="${NEWSCAN_MAX_TARGETS:-25}"
+        if [[ $DEEP != true ]] && ((max > 0)) && (($(wc -l <"$origins") > max)); then
+            head -n "$max" "$origins" >"${origins}.capped" && mv -f "${origins}.capped" "$origins"
+            _print_msg INFO "Limiting NewScan to ${max} origins (DEEP mode disabled)"
+        fi
+        if [[ ! -s "$origins" ]]; then
+            end_func "No web origins to scan with NewScan" "${FUNCNAME[0]}" SKIP_NOINPUT
+            return 0
+        fi
+
+        local max_par="${NEWSCAN_PARALLEL:-2}" idx=0 origin
+        ((max_par < 1)) && max_par=1
+        _print_msg INFO "Running: NewScan on $(wc -l <"$origins" | tr -d ' ') origin(s)"
+        while IFS= read -r origin; do
+            [[ -z "$origin" ]] && continue
+            while (($(jobs -rp | wc -l) >= max_par)); do wait -n 2>/dev/null || true; done
+            idx=$((idx + 1))
+            # Dry run stays in the foreground so run_command's dry-run tracking reaches the module summary.
+            if [[ "${DRY_RUN:-false}" == "true" ]]; then
+                _newscan_scan_origin "$origin" "$idx" "$image" </dev/null
+            else
+                _newscan_scan_origin "$origin" "$idx" "$image" </dev/null &
+            fi
+        done <"$origins"
+        wait
+
+        : >".tmp/newscan_findings.txt"
+        : >".tmp/newscan_findings.jsonl"
+        local failed=0 rc json
+        while IFS= read -r origin; do
+            json="vulns/newscan/$(_newscan_slug "$origin")/newscan.json"
+            rc=$(cat "vulns/newscan/$(_newscan_slug "$origin")/exit_code" 2>/dev/null)
+            [[ "${rc:-2}" == "0" || "${rc:-2}" == "1" ]] || failed=$((failed + 1))
+            [[ -s "$json" ]] || continue
+            jq -r --arg o "$origin" '.findings[]? | select((.ai_fp // false) | not)
+                | "[\((.severity // "info") | ascii_upcase)] \($o) \(.where // "") - \(.title // "untitled") [\(.category // "")] (\(.confidence // (if .verified then "confirmed" else "tentative" end)))"' \
+                "$json" >>".tmp/newscan_findings.txt" 2>>"$LOGFILE" || true
+            jq -c --arg o "$origin" '.findings[]? | {type:"finding", tool:"newscan",
+                severity:((.severity // "info") | ascii_downcase), name:(.title // ""),
+                finding_type:(.category // ""), target:$o,
+                host:($o | sub("^https?://"; "") | sub(":[0-9]+$"; "")), where:(.where // ""),
+                verified:(.verified // false), confidence:(.confidence // ""),
+                ai_false_positive:(.ai_fp // false), id:(.id // "")}' \
+                "$json" >>".tmp/newscan_findings.jsonl" 2>>"$LOGFILE" || true
+        done <"$origins"
+        anew -q "vulns/newscan.txt" <".tmp/newscan_findings.txt"
+        anew -q "vulns/newscan.jsonl" <".tmp/newscan_findings.jsonl"
+        append_assets_from_file finding value "vulns/newscan.txt"
+
+        ((failed > 0)) && notification "NewScan could not complete ${failed} origin(s); see vulns/newscan/*/console.log" warn
+        local total hc
+        total=$(sed '/^$/d' "vulns/newscan.txt" 2>/dev/null | wc -l | tr -d ' ')
+        hc=$(grep -cE '^\[(HIGH|CRITICAL)\]' "vulns/newscan.txt" 2>/dev/null || true)
+        end_func "${total:-0} NewScan findings (${hc:-0} high/critical) saved in vulns/newscan.txt" "${FUNCNAME[0]}"
+    else
+        if [[ ${NEWSCAN:-false} == false ]]; then
             skip_notification "disabled"
         else
             skip_notification "processed"
