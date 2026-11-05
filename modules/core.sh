@@ -596,6 +596,20 @@ function tools_installed() {
         _print_msg WARN "cloud_enum runtime not available; cloud enumeration steps will be skipped."
     fi
 
+    if [[ "${NEWSCAN:-false}" == "true" ]]; then
+        local newscan_image=""
+        if ! command -v docker >/dev/null 2>&1; then
+            all_installed=false
+            missing_tools+=("docker (NewScan)")
+        else
+            newscan_image=$(_newscan_resolve_image)
+            if [[ -z "$newscan_image" ]] || ! docker image inspect "$newscan_image" >/dev/null 2>&1; then
+                all_installed=false
+                missing_tools+=("NewScan image (${newscan_image:-newscan:*})")
+            fi
+        fi
+    fi
+
     if [[ $all_installed == true ]]; then
         : # Tools check OK, no output
     else
@@ -1935,6 +1949,7 @@ function generate_consolidated_report() {
                     "Takeovers|webs/takeover.txt" \
                     "Nuclei Critical|nuclei_output/critical.txt" \
                     "Nuclei High|nuclei_output/high.txt" \
+                    "NewScan Findings|vulns/newscan.txt" \
                     "Hotlist|hotlist.txt" \
                     "Performance Summary|.log/perf_summary.json" \
                     "Assets JSONL|assets.jsonl" \
@@ -2158,6 +2173,10 @@ function export_findings_jsonl() {
             done <"$f"
         fi
     done
+
+    if [[ -s vulns/newscan.jsonl ]] && command -v jq >/dev/null 2>&1; then
+        jq -c '. + {source_file:"vulns/newscan.jsonl"}' vulns/newscan.jsonl >>"$out_norm" 2>/dev/null || true
+    fi
 
     if [[ -s assets.jsonl ]]; then
         cp assets.jsonl "$out_assets"

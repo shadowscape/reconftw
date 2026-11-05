@@ -1,0 +1,4 @@
+{"meta":{"target":"https://api.example.com"},"counts":{"findings":3},"findings":[
+ {"id":"f1","title":"Broken object level authorization","severity":"high","category":"OWASP API1:BOLA","where":"GET /v1/users/{id}","verified":true,"confidence":"confirmed","ai_fp":false},
+ {"id":"f2","title":"Verbose server banner","severity":"low","category":"Misconfiguration","where":"GET /","verified":false,"confidence":"tentative","ai_fp":false},
+ {"id":"f3","title":"Likely false positive","severity":"medium","category":"Misc","where":"GET /x","verified":false,"ai_fp":true}]}

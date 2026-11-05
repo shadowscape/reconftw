@@ -543,6 +543,13 @@ function build_hotlist() {
             score["$h"]=$((${score["$h"]:-0} + 10))
         done < <(jq -r '.["matched-at"] // .host' "$f" 2>/dev/null)
     done
+    # NewScan high/critical
+    if [[ -s vulns/newscan.jsonl ]]; then
+        while read -r h; do
+            [[ -z $h ]] && continue
+            score["$h"]=$((${score["$h"]:-0} + 10))
+        done < <(jq -r 'select(.severity == "high" or .severity == "critical") | .host' vulns/newscan.jsonl 2>/dev/null)
+    fi
     # Takeovers
     [[ -s webs/takeover.txt ]] && while read -r h; do score["$h"]=$((${score["$h"]:-0} + 8)); done <webs/takeover.txt
     # Secrets
@@ -792,6 +799,7 @@ function vulns() {
             nuclei_dast
             4xxbypass
             test_ssl
+            newscan_checks
         else
             crlf_checks
             run_module_with_axiom_failover xss
@@ -809,6 +817,7 @@ function vulns() {
             run_module_with_axiom_failover nuclei_dast
             4xxbypass
             test_ssl
+            newscan_checks
         fi
     else
         _print_msg WARN "Vulnerability module disabled (VULNS_GENERAL=false). Use -a flag or set VULNS_GENERAL=true in config."

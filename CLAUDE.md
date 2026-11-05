@@ -150,6 +150,8 @@ reconFTW is a comprehensive bash-based reconnaissance automation framework used 
 - `ffufPostprocessing` (Damian89/ffufPostprocessing) — ffuf result analysis
 - `JSA` (w9w/JSA) — JS analysis
 - `ultimate-nmap-parser` (shifty0g/ultimate-nmap-parser) — Nmap XML parser
+### Docker-image tools (manual install, not in `install.sh`)
+- `NewScan` (New Normal Security, proprietary) — active API/web scanner; runs as `docker run --rm <newscan:tag> python -m newscan` once per live web origin via `newscan_checks` (`modules/vulns.sh`). Opt-in with `NEWSCAN=true`; image loaded with `docker load -i newscan-image.tar`. Output: `vulns/newscan.txt`, `vulns/newscan.jsonl`, `vulns/newscan/<host_port>/`
 ### System-Level Tools (apt/brew/yum)
 - `nmap` — active port scanning
 - `massdns` — DNS resolver (also cloned + built from source)
@@ -352,6 +354,7 @@ reconFTW is a comprehensive bash-based reconnaissance automation framework used 
 - Triggers: Called at the bottom of most workflow functions
 - Responsibilities: AI report, cleanup, Faraday, screenshot diffs, plugin events, hotlist, `export_reports()`, timing summary
 ## Output Directory Structure
+- `vulns/newscan*` — NewScan findings (`newscan.txt`, normalized `newscan.jsonl`, raw per-origin output under `vulns/newscan/<host_port>/`)
 ```
 ```
 ## Verbosity and Output Controls
